@@ -4,7 +4,7 @@
   Rodar:   node server.js
   Variáveis opcionais:
     PORT             porta (padrão 8080; Render/Railway/Fly já definem sozinhos)
-    MAX_ROOM         máximo de jogadores por sala (padrão 12)
+    MAX_ROOM         máximo de jogadores por sala (padrão 100)
     ALLOWED_ORIGINS  lista separada por vírgula de sufixos de domínio aceitos (ex.: "itch.zone,itch.io").
                      Vazio = aceita qualquer origem.
   O servidor é a AUTORIDADE do PvP: ele valida posição e velocidade, guarda a vida e o escudo de cada jogador,
@@ -12,14 +12,16 @@
   O que ele NÃO consegue controlar: o que acontece só no aparelho do jogador (meteoros, inimigos, progressão offline).
 */
 const http = require('http'), crypto = require('crypto');
-const PORT = +process.env.PORT || 8080, MAX_ROOM = +process.env.MAX_ROOM || 12, MAX_PER_IP = 6;
+const PORT = +process.env.PORT || 8080, MAX_ROOM = +process.env.MAX_ROOM || 100, MAX_PER_IP = +process.env.MAX_PER_IP || 8;
+const NEAR_R = 2200, FAR_MS = 400;   // quem está perto recebe tudo; quem está longe recebe a posição só a cada FAR_MS (poupa banda/CPU com 100 jogadores)
+const TP_CD = 1800, WCELL = 2200;   // buraco de minhoca: intervalo mínimo entre saltos (o jogo usa 2 s) e tamanho da célula do mapa de buracos
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 const rooms = new Map(), ipCount = new Map();
 
 // ---- regras do jogo conhecidas pelo servidor (devem bater com o cliente) ----
 const SHIPS = [{ hull: 70, sh: 0, v: 215 }, { hull: 100, sh: 50, v: 135 }, { hull: 150, sh: 0, v: 150 }, { hull: 100, sh: 20, v: 170 }, { hull: 130, sh: 30, v: 178, hg: 1 }];
-const SAFE_R = 300, HGC = 5000, HULL_BONUS_MAX = 250, SH_CAP = 400, RESPAWN_MS = 2500;
+const SAFE_R = 300, HGC = 5000, HULL_BONUS_MAX = 250, SH_CAP = 400, RESPAWN_MS = 2500, SPAWN_MAX = 1400, REVEAL_MS = 2500;   // SPAWN_MAX: raio máximo aceito para o renascimento; REVEAL_MS: quanto tempo quem ataca de dentro da nebulosa fica visível
 const WEAPON = {                      // dano máximo por acerto e por segundo (já com o multiplicador PvP e poder máximo)
   b: { hit: 40, dps: 170 }, m: { hit: 70, dps: 130 }, l: { hit: 40, dps: 170 }, o: { hit: 40, dps: 270 }, p: { hit: 100, dps: 130 }
 };
@@ -31,6 +33,35 @@ function docksNear(x, y) {            // docas dos hangares (mesma regra do clie
     out.push([Math.round((gx + 0.15 + 0.7 * hh(gx, gy, 201)) * HGC) - 175, Math.round((gy + 0.15 + 0.7 * hh(gx, gy, 202)) * HGC)]);
   }
   return out;
+}
+function wormPairs(x, y, R) {          // buracos de minhoca fixos no mundo (mesma regra do cliente)
+  const cx = Math.floor(x / WCELL), cy = Math.floor(y / WCELL), out = [];
+  for (let gx = cx - R; gx <= cx + R; gx++) for (let gy = cy - R; gy <= cy + R; gy++) {
+    if (hh(gx, gy, 300) >= 0.6) continue;
+    let ox = Math.floor(hh(gx, gy, 305) * 3) - 1, oy = Math.floor(hh(gx, gy, 306) * 3) - 1; if (!ox && !oy) ox = 1;
+    const a = { x: Math.round((gx + 0.15 + 0.7 * hh(gx, gy, 301)) * WCELL), y: Math.round((gy + 0.15 + 0.7 * hh(gx, gy, 302)) * WCELL) },
+      b = { x: Math.round((gx + ox + 0.15 + 0.7 * hh(gx, gy, 303)) * WCELL), y: Math.round((gy + oy + 0.15 + 0.7 * hh(gx, gy, 304)) * WCELL) };
+    if (Math.hypot(a.x, a.y) > SAFE_R + 60 && Math.hypot(b.x, b.y) > SAFE_R + 60 && Math.hypot(a.x - b.x, a.y - b.y) > 1200) out.push({ a, b });
+  }
+  return out;
+}
+// nebulosas fixas no mundo (mesma regra do cliente): quem está dentro de uma some do radar e da tela dos outros
+const NC = 300, nbc = new Map();
+function nebOf(cx, cy) {
+  if (hh(cx, cy, 70) >= 0.16) return null;
+  const x = (cx + 0.25 + 0.5 * hh(cx, cy, 71)) * NC, y = (cy + 0.25 + 0.5 * hh(cx, cy, 72)) * NC; if (Math.hypot(x, y) < 520) return null;
+  return { x, y, r: 75 + hh(cx, cy, 73) * 45, s: Math.floor(hh(cx, cy, 74) * 1e6) };
+}
+function nebBl(n) {
+  let b = nbc.get(n.s);
+  if (!b) { if (nbc.size > 5000) nbc.clear(); b = []; for (let k = 0; k < 7; k++) { const an = hh(n.s, k, 1) * 6.283, d = hh(n.s, k, 2) * n.r * 0.55; b.push([n.x + Math.cos(an) * d, n.y + Math.sin(an) * d, n.r * (0.4 + 0.35 * hh(n.s, k, 3))]) } nbc.set(n.s, b) }
+  return b;
+}
+function nebV(n, x, y) { let v = 0; for (const b of nebBl(n)) { const d2 = ((x - b[0]) ** 2 + (y - b[1]) ** 2) / (b[2] * b[2]); if (d2 < 1) v += 1 - d2 } return v }
+function inNebula(x, y) {
+  const c0 = Math.floor((x - 170) / NC), c1 = Math.floor((x + 170) / NC), d0 = Math.floor((y - 170) / NC), d1 = Math.floor((y + 170) / NC);
+  for (let i = c0; i <= c1; i++) for (let j = d0; j <= d1; j++) { const n = nebOf(i, j); if (n && nebV(n, x, y) > 0.45) return true }
+  return false;
 }
 const nearDock = (x, y) => docksNear(x, y).some(d => Math.hypot(x - d[0], y - d[1]) < 130);
 let nextId = 1;
@@ -53,9 +84,10 @@ class Client {
       tokens: 150, tl: Date.now(), drops: 0, st: null, k: 0, d: 0, dead: 0, lastDeath: 0, closed: false,
       x: 0, y: 0, vx: 0, vy: 0, a: 0, si: 0, hp: 100, hm: 100, sp: 0, deadAt: 0, hpInit: false, healB: 0, shB: 0, strikes: 0, posOk: false,
       lastSt: 0, lastShot: 0, lastPulse: 0, mHitT: 0, dockT: 0, still: 0, lz: 0, ob: 0, lzT: 0, obT: 0, ms: [], msT: 0, shots: [], pulse: null,
-      lastDmg: null, dmgB: {}, kills: new Map(), corrT: 0, lastDead: 0 });
+      lastDmg: null, dmgB: {}, kills: new Map(), corrT: 0, lastDead: 0, tpT: 0, farT: 0, neb: false, revealT: 0, hdn: false, hx: 0, hy: 0 });
   }
   send(o) { if (this.closed || this.sock.destroyed || !this.sock.writable) return; try { this.sock.write(frame(1, Buffer.from(JSON.stringify(o)))) } catch (e) { } }
+  sendRaw(buf) { if (this.closed || this.sock.destroyed || !this.sock.writable) return; try { this.sock.write(buf) } catch (e) { } }
   close() { try { this.sock.write(frame(8, Buffer.alloc(0))) } catch (e) { } this.sock.end(); }
 }
 
@@ -74,7 +106,8 @@ const bound = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const angDiff = (a, b) => Math.abs(Math.atan2(Math.sin(a - b), Math.cos(a - b)));
 const inSafe = c => Math.hypot(c.x, c.y) < SAFE_R;
 const cloaked = (c, now) => c.si === 4 && c.still && now - c.still >= 15000;
-const targetable = (c, now) => !c.dead && !inSafe(c) && !cloaked(c, now);
+const hiddenP = (c, now) => cloaked(c, now) || (c.neb && now - c.revealT >= REVEAL_MS);   // camuflagem da Aranha ou nebulosa (atacar revela por REVEAL_MS)
+const targetable = (c, now) => !c.dead && !inSafe(c) && !hiddenP(c, now);
 
 function kill(r, v, now, selfReport) {                   // o servidor decide a morte e o crédito do abate
   if (v.dead) return;
@@ -138,7 +171,7 @@ function handle(c, txt) {
     c.name = String(m.name || '').replace(/[\u0000-\u001f<>&"']/g, '').trim().slice(0, 14) || 'Piloto' + c.id;
     const si = num(m.ship, 0, 0, 9) | 0; c.si = si < SHIPS.length && !SHIPS[si].hg ? si : 0;   // naves de hangar não entram por aqui
     c.hm = SHIPS[c.si].hull; c.hp = c.hm; c.sp = SHIPS[c.si].sh; c.st = { x: 0, y: 0 }; c.room = r;
-    const list = [...r.clients.values()].map(o => ({ id: o.id, name: o.name, si: o.si, x: o.x, y: o.y, k: o.k, d: o.d }));
+    const list = [...r.clients.values()].map(o => ({ id: o.id, name: o.name, si: o.si, x: o.hdn ? o.hx : o.x, y: o.hdn ? o.hy : o.y, k: o.k, d: o.d }));
     r.clients.set(c.id, c);
     c.send({ t: 'welcome', id: c.id, room: rn, players: list });
     bc(r, c, { t: 'join', p: { id: c.id, name: c.name, si: c.si, x: 0, y: 0, k: 0, d: 0 } });
@@ -161,7 +194,7 @@ function handle(c, txt) {
     if (c.dead) {
       if (!m.dd && now - c.deadAt >= RESPAWN_MS) {         // renascimento: volta com a vida cheia perto da estação
         revived = true; c.dead = 0; c.hm = SHIPS[c.si].hull; c.hp = c.hm; c.sp = Math.min(num(m.s, 0, 0, SH_CAP), SHIPS[c.si].sh + 60); c.healB = 0; c.lastDmg = null;
-        if (Math.hypot(x, y) > 700) { x = 0; y = 0 }
+        if (Math.hypot(x, y) > SPAWN_MAX) { x = 0; y = 0 }
       } else { x = c.x; y = c.y }
     } else if (c.posOk) {
       const step = SHIPS[c.si].v * 1.7 * 1.4 * dt + 25, d = Math.hypot(x - c.x, y - c.y);
@@ -189,25 +222,42 @@ function handle(c, txt) {
     c.lz = noGun ? 0 : num(m.lz, 0, 0, 10) | 0; c.ob = noGun ? 0 : num(m.ob, 0, 0, 10) | 0;
     if (c.lz) c.lzT = now; if (c.ob) c.obT = now;
     c.ms = !noGun && Array.isArray(m.ms) ? m.ms.slice(0, 8).map(q => Array.isArray(q) ? q.slice(0, 5).map(v => r1(num(v))) : [0, 0, 0, 0, 0]) : [];
-    if (c.ms.length) c.msT = now;
-    bc(r, c, { t: 'st', id: c.id, x: c.x, y: c.y, vx: c.vx, vy: c.vy, a: c.a, si: c.si, h: Math.round(c.hp), hm: c.hm, s: Math.round(c.sp), th: m.th ? 1 : 0,
-      dd: c.dead ? 1 : 0, sf: inSafe(c) ? 1 : 0, hd: cloaked(c, now) ? 1 : 0, lz: c.lz, ob: c.ob, ms: c.ms });
+    if (c.ms.length) { c.msT = now; c.revealT = now }          // míssil no ar: quem atacou fica visível
+    c.neb = inNebula(c.x, c.y);
+    const hd = hiddenP(c, now); c.hdn = hd; if (!hd) { c.hx = c.x; c.hy = c.y }
+    // escondido (nebulosa/camuflagem): os outros recebem só a última posição visível e nenhum rastro de movimento ou armas — nem um cliente adulterado vê onde ele está
+    const out = frame(1, Buffer.from(JSON.stringify({ t: 'st', id: c.id, x: hd ? c.hx : c.x, y: hd ? c.hy : c.y, vx: hd ? 0 : c.vx, vy: hd ? 0 : c.vy, a: c.a, si: c.si, h: Math.round(c.hp), hm: c.hm, s: Math.round(c.sp), th: !hd && m.th ? 1 : 0,
+      dd: c.dead ? 1 : 0, sf: inSafe(c) ? 1 : 0, hd: hd ? 1 : 0, lz: hd ? 0 : c.lz, ob: hd ? 0 : c.ob, ms: c.ms })));   // serializa UMA vez e reaproveita para todos
+    const farTick = now - c.farT >= FAR_MS; if (farTick) c.farT = now;
+    for (const o of r.clients.values()) if (o !== c && (farTick || Math.hypot(o.x - c.x, o.y - c.y) < NEAR_R)) o.sendRaw(out);
     return;
+  }
+  if (m.t === 'tp') {                                    // buraco de minhoca: só vale entre as DUAS pontas de um buraco que existe de verdade
+    if (!c.posOk || c.dead) return;
+    if (now - c.tpT < TP_CD) { strike(c, 3); return }
+    const x = r1(num(m.x)), y = r1(num(m.y)); let to = null;
+    for (const p of wormPairs(c.x, c.y, 2)) {            // entrada: ponta perto de onde o servidor vê a nave (folga para latência); saída: a outra ponta
+      if (Math.hypot(p.a.x - c.x, p.a.y - c.y) < 300) to = p.b; else if (Math.hypot(p.b.x - c.x, p.b.y - c.y) < 300) to = p.a;
+      if (to) break;
+    }
+    if (!to || Math.hypot(x - to.x, y - to.y) > 60) { strike(c, 3); return }
+    c.tpT = now; c.x = x; c.y = y; c.lastSt = now; return;
   }
   if (m.t === 'shot') {
     if (!c.posOk || c.dead || c.si === 4 || inSafe(c) || now - c.lastShot < 55) return;
     if (Math.hypot(num(m.x) - c.x, num(m.y) - c.y) > 90) return;          // origem falsa
-    c.lastShot = now; const n = num(m.n, 1, 1, 4) | 0, a = Math.round(num(m.a, 0, -20, 20) * 100) / 100;
+    c.lastShot = now; c.revealT = now; const n = num(m.n, 1, 1, 4) | 0, a = Math.round(num(m.a, 0, -20, 20) * 100) / 100;
     c.shots.push({ t: now, x: c.x, y: c.y, vx: (c.vx + Math.cos(a) * 280) * 1.1, vy: (c.vy + Math.sin(a) * 280) * 1.1, n }); if (c.shots.length > 30) c.shots.shift();
     bc(r, c, { t: 'shot', id: c.id, x: c.x, y: c.y, vx: c.vx, vy: c.vy, a, n }); return;
   }
   if (m.t === 'pulse') {
-    if (!c.posOk || c.dead || inSafe(c) || now - c.lastPulse < 500) return; c.lastPulse = now;
+    if (!c.posOk || c.dead || inSafe(c) || now - c.lastPulse < 500) return; c.lastPulse = now; c.revealT = now;
     const R = num(m.R, 50, 10, 200); c.pulse = { t: now, x: c.x, y: c.y, R, ids: new Set() };
     bc(r, c, { t: 'pulse', id: c.id, x: c.x, y: c.y, R }); return;
   }
   if (m.t === 'hit') {
-    if (c.dead || inSafe(c)) return;                     // quem ataca precisa estar vivo e fora da zona segura
+    if (c.dead || inSafe(c)) return; c.revealT = now;    // atacar revela quem está na nebulosa
+    // quem ataca precisa estar vivo e fora da zona segura
     const tg = r.clients.get(num(m.to) | 0); if (!tg || tg === c || !targetable(tg, now)) return;
     const d = validHit(c, tg, m, now); if (d <= 0) { strike(c, 1); return }
     takeDmg(r, tg, c, d, now); return;
@@ -278,4 +328,4 @@ setInterval(() => {
 }, 20000).unref();
 
 if (require.main === module) server.listen(PORT, () => console.log('Noxis PvP server na porta ' + PORT));
-module.exports = server; module.exports.__t = { handle, Client, rooms, SHIPS, nearDock, docksNear };
+module.exports = server; module.exports.__t = { handle, Client, rooms, SHIPS, nearDock, docksNear, wormPairs, inNebula };
