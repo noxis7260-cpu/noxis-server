@@ -3,6 +3,6 @@
   "version": "1.0.0",
   "description": "Servidor PvP do Noxis Warriors (sem dependências)",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
+  "scripts": { "start": "node server.js", "test": "node teste-anticheat.js" },
   "engines": { "node": ">=18" }
 }
