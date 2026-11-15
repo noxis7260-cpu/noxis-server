@@ -11,7 +11,7 @@
   confere cada acerto (alcance, direção, arma, taxa de dano) e decide sozinho quem morreu e quem ganha o abate.
   O que ele NÃO consegue controlar: o que acontece só no aparelho do jogador (meteoros, inimigos, progressão offline).
 */
-const http = require('http'), crypto = require('crypto');
+const http = require('http'), crypto = require('crypto'), fs = require('fs'), path = require('path');
 const PORT = +process.env.PORT || 8080, MAX_ROOM = +process.env.MAX_ROOM || 100, MAX_PER_IP = +process.env.MAX_PER_IP || 8;
 const NEAR_R = 2200, FAR_MS = 400;   // quem está perto recebe tudo; quem está longe recebe a posição só a cada FAR_MS (poupa banda/CPU com 100 jogadores)
 const TP_CD = 1800, WCELL = 2200;   // buraco de minhoca: intervalo mínimo entre saltos (o jogo usa 2 s) e tamanho da célula do mapa de buracos
@@ -109,14 +109,78 @@ const cloaked = (c, now) => c.si === 4 && c.still && now - c.still >= 15000;
 const hiddenP = (c, now) => cloaked(c, now) || (c.neb && now - c.revealT >= REVEAL_MS);   // camuflagem da Aranha ou nebulosa (atacar revela por REVEAL_MS)
 const targetable = (c, now) => !c.dead && !inSafe(c) && !hiddenP(c, now);
 
+// ---------- PLACAR (pontos do PvP) ----------
+// Os pontos só nascem aqui, de abates que o servidor validou (o cliente não manda pontuação).
+// Cada abate vale 100 pontos + 25 por abate extra em sequência sem morrer (máx. +100).
+// Anti-farm: abater várias vezes o mesmo nome em 10 min vale 100% / 50% / 25% / 5%.
+// Guardado por nome (sem contas): quem usa o mesmo nome soma na mesma linha. Nomes automáticos ("Piloto7") não entram.
+// Persistência: arquivo local (BOARD_FILE) e, se configurado, Upstash Redis (UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN).
+// No Render grátis o disco é apagado quando o serviço reinicia, então use o Upstash para o placar não zerar.
+const BOARD_FILE = process.env.BOARD_FILE || path.join(__dirname, 'leaderboard.json');
+const KV_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/+$/, ''), KV_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
+const KV_KEY = process.env.BOARD_KEY || 'noxis:leaderboard:v1';
+const BOARD_MAX = 500, POINTS_KILL = 100;
+const board = new Map();   // nome em minúsculas -> { n, pts, k, d, t }
+let boardTimer = null;
+const autoName = n => /^Piloto\d+$/.test(n);
+const boardRow = name => { const key = name.toLowerCase(); let e = board.get(key); if (!e) { e = { n: name, pts: 0, k: 0, d: 0, t: 0 }; board.set(key, e) } e.n = name; return e };
+const boardSorted = () => [...board.values()].sort((a, b) => b.pts - a.pts || b.k - a.k || a.d - b.d || a.t - b.t);
+const boardJson = () => JSON.stringify(boardSorted().slice(0, BOARD_MAX));
+function boardTouch() { if (!boardTimer) { boardTimer = setTimeout(() => { boardTimer = null; boardSave() }, 4000); boardTimer.unref() } }
+async function kv(cmd) {
+  const r = await fetch(KV_URL, { method: 'POST', headers: { Authorization: 'Bearer ' + KV_TOKEN, 'Content-Type': 'application/json' }, body: JSON.stringify(cmd) });
+  if (!r.ok) throw new Error('KV ' + r.status);
+  return (await r.json()).result;
+}
+async function boardSave() {
+  const js = boardJson();
+  try { fs.writeFileSync(BOARD_FILE + '.tmp', js); fs.renameSync(BOARD_FILE + '.tmp', BOARD_FILE) } catch (e) { console.log('placar: não consegui gravar o arquivo (' + e.message + ')') }
+  if (KV_URL && KV_TOKEN && typeof fetch === 'function') { try { await kv(['SET', KV_KEY, js]) } catch (e) { console.log('placar: falha ao gravar no Upstash (' + e.message + ')') } }
+}
+async function boardLoad() {
+  let txt = null;
+  if (KV_URL && KV_TOKEN && typeof fetch === 'function') { try { txt = await kv(['GET', KV_KEY]) } catch (e) { console.log('placar: falha ao ler do Upstash (' + e.message + ')') } }
+  if (!txt) { try { txt = fs.readFileSync(BOARD_FILE, 'utf8') } catch (e) { } }
+  if (!txt) return;
+  try {
+    for (const e of JSON.parse(txt)) {
+      const n = String(e.n || '').slice(0, 14); if (!n) continue;
+      const row = boardRow(n); row.pts = Math.max(row.pts, e.pts | 0); row.k = Math.max(row.k, e.k | 0); row.d = Math.max(row.d, e.d | 0); row.t = e.t || 0;
+    }
+    console.log('placar carregado: ' + board.size + ' jogador(es)');
+  } catch (e) { console.log('placar: arquivo inválido, começando vazio') }
+}
+function boardTop(n, name) {
+  const all = boardSorted(), out = { top: all.slice(0, n).map(e => ({ n: e.n, pts: e.pts, k: e.k, d: e.d })), total: all.length };
+  const q = String(name || '').trim().toLowerCase();
+  if (q) { const i = all.findIndex(e => e.n.toLowerCase() === q); if (i >= 0) out.me = { rank: i + 1, n: all[i].n, pts: all[i].pts, k: all[i].k, d: all[i].d } }
+  return out;
+}
+function awardKill(kl, v, now) {
+  const key = v.name.toLowerCase(), pr = kl.pairs || (kl.pairs = new Map()), rec = pr.get(key);
+  const n = rec && now - rec.t < 600000 ? rec.n : 0;
+  pr.set(key, { n: n + 1, t: now });
+  const mult = [1, 0.5, 0.25][n] ?? 0.05, bonus = Math.min(4, Math.max(0, kl.streak - 1)) * 25;
+  const pts = Math.max(1, Math.round((POINTS_KILL + bonus) * mult));
+  kl.pts = (kl.pts || 0) + pts;
+  if (!autoName(kl.name)) { const e = boardRow(kl.name); e.pts += pts; e.k++; e.t = now; boardTouch() }
+  return pts;
+}
+const limits = new Map();   // limite de consultas do placar por IP (60/min)
+const tooMany = ip => { const now = Date.now(); let l = limits.get(ip); if (!l || now - l.t > 60000) { l = { t: now, n: 0 }; limits.set(ip, l) } return ++l.n > 60 };
+setInterval(() => { const now = Date.now(); for (const [k, l] of limits) if (now - l.t > 60000) limits.delete(k) }, 120000).unref();
+
 function kill(r, v, now, selfReport) {                   // o servidor decide a morte e o crédito do abate
   if (v.dead) return;
   v.dead = 1; v.deadAt = now; v.d++; v.hp = 0;
   let kl = null;
   if (v.lastDmg && now - v.lastDmg.t < 10000) { const o = r.clients.get(v.lastDmg.id); if (o && o !== v) kl = o }
-  if (kl) { const lk = kl.kills.get(v.id) || 0; if (now - lk >= 30000) { kl.kills.set(v.id, now); kl.k++ } }   // o mesmo par só pontua a cada 30 s
+  let pt = 0;
+  if (kl) { const lk = kl.kills.get(v.id) || 0; if (now - lk >= 30000) { kl.kills.set(v.id, now); kl.k++; kl.streak = (kl.streak || 0) + 1; pt = awardKill(kl, v, now) } }   // o mesmo par só pontua a cada 30 s
+  v.streak = 0;
+  if (kl && !autoName(v.name)) { boardRow(v.name).d++; boardTouch() }
   v.send({ t: 'die', by: kl ? kl.id : 0 });
-  for (const o of r.clients.values()) o.send({ t: 'kill', k: kl ? kl.id : 0, v: v.id, kn: kl ? kl.name : '', vn: v.name, kk: kl ? kl.k : 0, vd: v.d });
+  for (const o of r.clients.values()) o.send({ t: 'kill', k: kl ? kl.id : 0, v: v.id, kn: kl ? kl.name : '', vn: v.name, kk: kl ? kl.k : 0, vd: v.d, pt, kp: kl ? kl.pts || 0 : 0 });
 }
 
 function takeDmg(r, tg, from, d, now) {                   // escudo absorve primeiro, depois o casco
@@ -171,7 +235,7 @@ function handle(c, txt) {
     c.name = String(m.name || '').replace(/[\u0000-\u001f<>&"']/g, '').trim().slice(0, 14) || 'Piloto' + c.id;
     const si = num(m.ship, 0, 0, 9) | 0; c.si = si < SHIPS.length && !SHIPS[si].hg ? si : 0;   // naves de hangar não entram por aqui
     c.hm = SHIPS[c.si].hull; c.hp = c.hm; c.sp = SHIPS[c.si].sh; c.st = { x: 0, y: 0 }; c.room = r;
-    const list = [...r.clients.values()].map(o => ({ id: o.id, name: o.name, si: o.si, x: o.hdn ? o.hx : o.x, y: o.hdn ? o.hy : o.y, k: o.k, d: o.d }));
+    const list = [...r.clients.values()].map(o => ({ id: o.id, name: o.name, si: o.si, x: o.hdn ? o.hx : o.x, y: o.hdn ? o.hy : o.y, k: o.k, d: o.d, pts: o.pts || 0 }));
     r.clients.set(c.id, c);
     c.send({ t: 'welcome', id: c.id, room: rn, players: list });
     bc(r, c, { t: 'join', p: { id: c.id, name: c.name, si: c.si, x: 0, y: 0, k: 0, d: 0 } });
@@ -292,6 +356,14 @@ function onData(c, chunk) {
 }
 
 const server = http.createServer((req, res) => {
+  const u = new URL(req.url || '/', 'http://x');
+  if (u.pathname === '/leaderboard') {   // público: qualquer pessoa (ou o jogo, de qualquer site) pode ler
+    const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+    if (tooMany(ip)) { res.writeHead(429, { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' }); return res.end('{"error":"too many requests"}') }
+    const n = Math.max(1, Math.min(50, +u.searchParams.get('n') || 20));
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'public, max-age=5' });
+    return res.end(JSON.stringify(boardTop(n, u.searchParams.get('name'))));
+  }
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
   let n = 0; for (const r of rooms.values()) n += r.clients.size;
   res.end('Noxis Warriors PvP server OK — ' + n + ' jogador(es) em ' + rooms.size + ' sala(s)\n');
@@ -327,5 +399,10 @@ setInterval(() => {
   }
 }, 20000).unref();
 
-if (require.main === module) server.listen(PORT, () => console.log('Noxis PvP server na porta ' + PORT));
-module.exports = server; module.exports.__t = { handle, Client, rooms, SHIPS, nearDock, docksNear, wormPairs, inNebula };
+if (require.main === module) {
+  boardLoad();
+  server.listen(PORT, () => console.log('Noxis PvP server na porta ' + PORT));
+  const bye = async () => { try { await boardSave() } catch (e) { } process.exit(0) };   // o Render avisa (SIGTERM) antes de reiniciar: grava o placar
+  process.on('SIGTERM', bye); process.on('SIGINT', bye);
+}
+module.exports = server; module.exports.__t = { kill, board, boardTop, boardLoad, boardSave, handle, Client, rooms, SHIPS, nearDock, docksNear, wormPairs, inNebula };
