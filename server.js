@@ -113,17 +113,28 @@ const targetable = (c, now) => !c.dead && !inSafe(c) && !hiddenP(c, now);
 // Os pontos só nascem aqui, de abates que o servidor validou (o cliente não manda pontuação).
 // Cada abate vale 100 pontos + 25 por abate extra em sequência sem morrer (máx. +100).
 // Anti-farm: abater várias vezes o mesmo nome em 10 min vale 100% / 50% / 25% / 5%.
+// Pontos de PvE (meteoros, inimigos, níveis) NÃO podem ser validados aqui: o jogo roda no aparelho do jogador. O cliente manda
+// lotes pequenos em POST /score e o servidor limita quanto cada nome pode receber (PVE_CAP pontos a cada 10 min), para a trapaça render pouco.
 // Guardado por nome (sem contas): quem usa o mesmo nome soma na mesma linha. Nomes automáticos ("Piloto7") não entram.
 // Persistência: arquivo local (BOARD_FILE) e, se configurado, Upstash Redis (UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN).
 // No Render grátis o disco é apagado quando o serviço reinicia, então use o Upstash para o placar não zerar.
 const BOARD_FILE = process.env.BOARD_FILE || path.join(__dirname, 'leaderboard.json');
 const KV_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/+$/, ''), KV_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
 const KV_KEY = process.env.BOARD_KEY || 'noxis:leaderboard:v1';
-const BOARD_MAX = 500, POINTS_KILL = 100;
+const BOARD_MAX = 500, POINTS_KILL = 100, PVE_CAP = +process.env.PVE_CAP || 1500, PVE_POST_MAX = 600;   // PvE: no máximo PVE_CAP pontos por nome a cada 10 min
 const board = new Map();   // nome em minúsculas -> { n, pts, k, d, t }
 let boardTimer = null;
 const autoName = n => /^Piloto\d+$/.test(n);
-const boardRow = name => { const key = name.toLowerCase(); let e = board.get(key); if (!e) { e = { n: name, pts: 0, k: 0, d: 0, t: 0 }; board.set(key, e) } e.n = name; return e };
+const boardRow = name => { const key = name.toLowerCase(); let e = board.get(key); if (!e) { e = { n: name, pts: 0, k: 0, d: 0, pve: 0, t: 0 }; board.set(key, e); if (board.size > BOARD_MAX * 2) boardPrune() } e.n = name; return e };
+function boardPrune() { const keep = boardSorted().slice(0, BOARD_MAX); board.clear(); for (const e of keep) board.set(e.n.toLowerCase(), e) }   // nomes inventados em massa não enchem a memória
+const safeName = v => String(v || '').replace(/[\u0000-\u001f<>&"']/g, '').trim().slice(0, 14);
+const pveWin = new Map();   // nome -> { t, sum } janela de 10 min dos pontos PvE
+function pveCredit(name, p, now) {   // devolve quantos pontos de PvE foram aceitos
+  p = Math.floor(+p); if (!(p > 0)) return 0; p = Math.min(p, PVE_POST_MAX);
+  const key = name.toLowerCase(); let w = pveWin.get(key); if (!w || now - w.t > 600000) { w = { t: now, sum: 0 }; pveWin.set(key, w) }
+  const ok = Math.max(0, Math.min(p, PVE_CAP - w.sum)); if (!ok) return 0;
+  w.sum += ok; const e = boardRow(name); e.pts += ok; e.pve = (e.pve || 0) + ok; e.t = now; boardTouch(); return ok;
+}
 const boardSorted = () => [...board.values()].sort((a, b) => b.pts - a.pts || b.k - a.k || a.d - b.d || a.t - b.t);
 const boardJson = () => JSON.stringify(boardSorted().slice(0, BOARD_MAX));
 function boardTouch() { if (!boardTimer) { boardTimer = setTimeout(() => { boardTimer = null; boardSave() }, 4000); boardTimer.unref() } }
@@ -145,7 +156,7 @@ async function boardLoad() {
   try {
     for (const e of JSON.parse(txt)) {
       const n = String(e.n || '').slice(0, 14); if (!n) continue;
-      const row = boardRow(n); row.pts = Math.max(row.pts, e.pts | 0); row.k = Math.max(row.k, e.k | 0); row.d = Math.max(row.d, e.d | 0); row.t = e.t || 0;
+      const row = boardRow(n); row.pts = Math.max(row.pts, e.pts | 0); row.k = Math.max(row.k, e.k | 0); row.d = Math.max(row.d, e.d | 0); row.pve = Math.max(row.pve || 0, e.pve | 0); row.t = e.t || 0;
     }
     console.log('placar carregado: ' + board.size + ' jogador(es)');
   } catch (e) { console.log('placar: arquivo inválido, começando vazio') }
@@ -167,8 +178,8 @@ function awardKill(kl, v, now) {
   return pts;
 }
 const limits = new Map();   // limite de consultas do placar por IP (60/min)
-const tooMany = ip => { const now = Date.now(); let l = limits.get(ip); if (!l || now - l.t > 60000) { l = { t: now, n: 0 }; limits.set(ip, l) } return ++l.n > 60 };
-setInterval(() => { const now = Date.now(); for (const [k, l] of limits) if (now - l.t > 60000) limits.delete(k) }, 120000).unref();
+const tooMany = (ip, kind = 'lb') => { const now = Date.now(), k = kind + ip; let l = limits.get(k); if (!l || now - l.t > 60000) { l = { t: now, n: 0 }; limits.set(k, l) } return ++l.n > (kind === 'score' ? 30 : 60) };
+setInterval(() => { const now = Date.now(); for (const [k, l] of limits) if (now - l.t > 60000) limits.delete(k); for (const [k, w] of pveWin) if (now - w.t > 600000) pveWin.delete(k) }, 120000).unref();
 
 function kill(r, v, now, selfReport) {                   // o servidor decide a morte e o crédito do abate
   if (v.dead) return;
@@ -355,8 +366,26 @@ function onData(c, chunk) {
   }
 }
 
+const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS' };
 const server = http.createServer((req, res) => {
   const u = new URL(req.url || '/', 'http://x');
+  if (u.pathname === '/score') {   // o jogo manda os pontos de PvE (meteoros, inimigos, níveis) em lotes
+    if (req.method === 'OPTIONS') { res.writeHead(204, CORS); return res.end() }
+    const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+    const done = (code, obj) => { res.writeHead(code, { ...CORS, 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)) };
+    if (req.method !== 'POST') return done(405, { error: 'use POST' });
+    if (tooMany(ip, 'score')) return done(429, { error: 'too many requests' });
+    let body = '', big = false;
+    req.on('data', d => { body += d; if (body.length > 512) { big = true; req.destroy() } });
+    req.on('end', () => {
+      if (big) return;
+      let m; try { m = JSON.parse(body) } catch (e) { return done(400, { error: 'bad json' }) }
+      const name = safeName(m && m.n);
+      if (!name || autoName(name)) return done(200, { ok: true, credited: 0, why: 'name' });
+      done(200, { ok: true, credited: pveCredit(name, m.p, Date.now()) });
+    });
+    return;
+  }
   if (u.pathname === '/leaderboard') {   // público: qualquer pessoa (ou o jogo, de qualquer site) pode ler
     const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
     if (tooMany(ip)) { res.writeHead(429, { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' }); return res.end('{"error":"too many requests"}') }
@@ -405,4 +434,4 @@ if (require.main === module) {
   const bye = async () => { try { await boardSave() } catch (e) { } process.exit(0) };   // o Render avisa (SIGTERM) antes de reiniciar: grava o placar
   process.on('SIGTERM', bye); process.on('SIGINT', bye);
 }
-module.exports = server; module.exports.__t = { kill, board, boardTop, boardLoad, boardSave, handle, Client, rooms, SHIPS, nearDock, docksNear, wormPairs, inNebula };
+module.exports = server; module.exports.__t = { pveCredit, kill, board, boardTop, boardLoad, boardSave, handle, Client, rooms, SHIPS, nearDock, docksNear, wormPairs, inNebula };
