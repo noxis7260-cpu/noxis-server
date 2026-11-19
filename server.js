@@ -25,44 +25,10 @@ const SAFE_R = 300, HGC = 5000, HULL_BONUS_MAX = 250, SH_CAP = 400, RESPAWN_MS =
 const WEAPON = {                      // dano máximo por acerto e por segundo (já com o multiplicador PvP e poder máximo)
   b: { hit: 40, dps: 170 }, m: { hit: 70, dps: 130 }, l: { hit: 40, dps: 170 }, o: { hit: 40, dps: 270 }, p: { hit: 100, dps: 130 }
 };
-const hh = (x, y, s) => { let n = (Math.imul(x, 374761393) + Math.imul(y, 668265263) + Math.imul(s || 0, 2147483647)) | 0; n = Math.imul(n ^ (n >>> 13), 1274126177); return ((n ^ (n >>> 16)) >>> 0) / 4294967296 };
-function docksNear(x, y) {            // docas dos hangares (mesma regra do cliente)
-  const out = [[1700 - 175, -1300]], cx = Math.floor(x / HGC), cy = Math.floor(y / HGC);
-  for (let gx = cx - 1; gx <= cx + 1; gx++) for (let gy = cy - 1; gy <= cy + 1; gy++) {
-    if ((gx === 0 && gy === 0) || hh(gx, gy, 200) >= 0.2) continue;
-    out.push([Math.round((gx + 0.15 + 0.7 * hh(gx, gy, 201)) * HGC) - 175, Math.round((gy + 0.15 + 0.7 * hh(gx, gy, 202)) * HGC)]);
-  }
-  return out;
-}
-function wormPairs(x, y, R) {          // buracos de minhoca fixos no mundo (mesma regra do cliente)
-  const cx = Math.floor(x / WCELL), cy = Math.floor(y / WCELL), out = [];
-  for (let gx = cx - R; gx <= cx + R; gx++) for (let gy = cy - R; gy <= cy + R; gy++) {
-    if (hh(gx, gy, 300) >= 0.6) continue;
-    let ox = Math.floor(hh(gx, gy, 305) * 3) - 1, oy = Math.floor(hh(gx, gy, 306) * 3) - 1; if (!ox && !oy) ox = 1;
-    const a = { x: Math.round((gx + 0.15 + 0.7 * hh(gx, gy, 301)) * WCELL), y: Math.round((gy + 0.15 + 0.7 * hh(gx, gy, 302)) * WCELL) },
-      b = { x: Math.round((gx + ox + 0.15 + 0.7 * hh(gx, gy, 303)) * WCELL), y: Math.round((gy + oy + 0.15 + 0.7 * hh(gx, gy, 304)) * WCELL) };
-    if (Math.hypot(a.x, a.y) > SAFE_R + 60 && Math.hypot(b.x, b.y) > SAFE_R + 60 && Math.hypot(a.x - b.x, a.y - b.y) > 1200) out.push({ a, b });
-  }
-  return out;
-}
-// nebulosas fixas no mundo (mesma regra do cliente): quem está dentro de uma some do radar e da tela dos outros
-const NC = 300, nbc = new Map();
-function nebOf(cx, cy) {
-  if (hh(cx, cy, 70) >= 0.16) return null;
-  const x = (cx + 0.25 + 0.5 * hh(cx, cy, 71)) * NC, y = (cy + 0.25 + 0.5 * hh(cx, cy, 72)) * NC; if (Math.hypot(x, y) < 520) return null;
-  return { x, y, r: 75 + hh(cx, cy, 73) * 45, s: Math.floor(hh(cx, cy, 74) * 1e6) };
-}
-function nebBl(n) {
-  let b = nbc.get(n.s);
-  if (!b) { if (nbc.size > 5000) nbc.clear(); b = []; for (let k = 0; k < 7; k++) { const an = hh(n.s, k, 1) * 6.283, d = hh(n.s, k, 2) * n.r * 0.55; b.push([n.x + Math.cos(an) * d, n.y + Math.sin(an) * d, n.r * (0.4 + 0.35 * hh(n.s, k, 3))]) } nbc.set(n.s, b) }
-  return b;
-}
-function nebV(n, x, y) { let v = 0; for (const b of nebBl(n)) { const d2 = ((x - b[0]) ** 2 + (y - b[1]) ** 2) / (b[2] * b[2]); if (d2 < 1) v += 1 - d2 } return v }
-function inNebula(x, y) {
-  const c0 = Math.floor((x - 170) / NC), c1 = Math.floor((x + 170) / NC), d0 = Math.floor((y - 170) / NC), d1 = Math.floor((y + 170) / NC);
-  for (let i = c0; i <= c1; i++) for (let j = d0; j <= d1; j++) { const n = nebOf(i, j); if (n && nebV(n, x, y) > 0.45) return true }
-  return false;
-}
+let W; try { W = require('./world.js') } catch (e) { console.error('ERRO: falta o arquivo world.js ao lado do server.js. Envie os DOIS arquivos para o servidor.'); process.exit(1) }   // regras do mundo (hash, nebulosas, buracos de minhoca, hangares): o MESMO arquivo que o jogo usa
+const docksNear = (x, y) => W.hangarsAround(x, y, 1).map(q => [q.x - 175, q.y]);   // docas dos hangares
+const wormPairs = W.wormPairs;       // buracos de minhoca fixos no mundo
+const inNebula = W.hidden;           // quem está dentro de uma nebulosa some do radar e da tela dos outros
 const nearDock = (x, y) => docksNear(x, y).some(d => Math.hypot(x - d[0], y - d[1]) < 130);
 let nextId = 1;
 
